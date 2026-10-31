@@ -1,0 +1,147 @@
+name: 'Mifos CLA check'
+description: >-
+  Verify the pull-request author belongs to an approved contributors team; otherwise comment with the CLA signing
+  steps, label the PR, and fail the check until the CLA is on file.
+author: 'Mifos Initiative'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  app-id:
+    description: 'GitHub App ID used to read team membership and comment as the bot (e.g. secrets.CLA_APP_ID).'
+    required: true
+  private-key:
+    description: 'Private key of that GitHub App (e.g. secrets.CLA_APP_PRIVATE_KEY).'
+    required: true
+  org:
+    description: 'Organization whose teams hold the approved contributors.'
+    required: false
+    default: 'openMF'
+  app-owner:
+    description: 'Owner the App installation token is minted for. Defaults to `org`.'
+    required: false
+    default: ''
+  teams:
+    description: 'Comma-separated team slugs; membership in any one of them clears the check.'
+    required: false
+    default: 'contributors,contracted-contributors'
+  cla-url:
+    description: 'Where a contributor signs the CLA. Linked from the comment.'
+    required: false
+    default: 'https://mifos.org/about-us/financial-legal/mifos-contributor-agreement'
+  label:
+    description: 'Label added while the CLA is missing and removed once the author is verified. Empty disables labelling.'
+    required: false
+    default: 'cla-required'
+  skip-bots:
+    description: 'Skip the check for pull requests opened by bot accounts.'
+    required: false
+    default: 'true'
+
+outputs:
+  verified:
+    description: '`true` when the author is in an approved team (or is a skipped bot), otherwise `false`.'
+    value: ${{ steps.check.outputs.verified }}
+  team:
+    description: 'The team that verified the author, if any.'
+    value: ${{ steps.check.outputs.team }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Generate App token
+      id: app-token
+      uses: actions/create-github-app-token@v2
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.private-key }}
+        owner: ${{ inputs.app-owner != '' && inputs.app-owner || inputs.org }}
+
+    - name: Check contributor team membership
+      id: check
+      uses: actions/github-script@v7
+      env:
+        CLA_ORG: ${{ inputs.org }}
+        CLA_TEAMS: ${{ inputs.teams }}
+        CLA_URL: ${{ inputs.cla-url }}
+        CLA_LABEL: ${{ inputs.label }}
+        CLA_SKIP_BOTS: ${{ inputs.skip-bots }}
+      with:
+        github-token: ${{ steps.app-token.outputs.token }}
+        script: |
+          const pr = context.payload.pull_request;
+          if (!pr) {
+            core.setFailed('mifos-x-cla-check runs on pull_request / pull_request_target events only.');
+            return;
+          }
+          const author = pr.user.login;
+          const org = process.env.CLA_ORG;
+          const teams = process.env.CLA_TEAMS.split(',').map((t) => t.trim()).filter(Boolean);
+          const label = process.env.CLA_LABEL.trim();
+          const issue = { owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number };
+          const MARKER = '<!-- mifos-x-cla-check -->';
+
+          if (process.env.CLA_SKIP_BOTS === 'true' && pr.user.type === 'Bot') {
+            core.info(`Bot PR by @${author} — skipping CLA check.`);
+            core.setOutput('verified', 'true');
+            core.setOutput('team', '');
+            return;
+          }
+
+          // One App token covers members:read (team lookup) and pull-requests:write (comment + label),
+          // so every action appears as the App's bot, never a personal account.
+          let team = null;
+          for (const slug of teams) {
+            try {
+              const { data } = await github.rest.teams.getMembershipForUserInOrg({ org, team_slug: slug, username: author });
+              if (data.state === 'active') { team = slug; break; }
+            } catch (e) {
+              if (e.status !== 404) throw e; // 404 = not in this team; anything else is a real error
+            }
+          }
+
+          // Find our previous comment so a re-run updates it instead of posting another one.
+          const comments = await github.paginate(github.rest.issues.listComments, { ...issue, per_page: 100 });
+          const previous = comments.find((c) => c.body && c.body.includes(MARKER));
+
+          if (team) {
+            core.info(`@${author} is verified via the '${team}' team ✓`);
+            core.setOutput('verified', 'true');
+            core.setOutput('team', team);
+            if (label) {
+              try { await github.rest.issues.removeLabel({ ...issue, name: label }); } catch (e) { /* not present */ }
+            }
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner: issue.owner, repo: issue.repo, comment_id: previous.id,
+                body: `${MARKER}\n✅ Thank you @${author} — your Contributor License Agreement is on file. This check is now clear.`,
+              });
+            }
+            return;
+          }
+
+          core.setOutput('verified', 'false');
+          core.setOutput('team', '');
+          const body =
+            `${MARKER}\n` +
+            `👋 Hi @${author} — thank you for your pull request.\n\n` +
+            `**This PR is currently blocked** because we do not have a Contributor License Agreement (CLA) on file for your GitHub account.\n\n` +
+            `To get unblocked:\n` +
+            `1. Complete the form at ${process.env.CLA_URL}\n` +
+            `2. Complete the CLA signing process\n` +
+            `3. Once verified (this can take up to 48 working hours) you will be invited to the approved contributors list\n` +
+            `4. You will receive an email from GitHub at your registered email address for the account with a link you must accept (this may go into your Junk folder, so please check it)\n` +
+            `5. Once accepted, you will be added to the approved contributors list and this PR check will be cleared`;
+          if (previous) {
+            await github.rest.issues.updateComment({ owner: issue.owner, repo: issue.repo, comment_id: previous.id, body });
+          } else {
+            await github.rest.issues.createComment({ ...issue, body });
+          }
+          if (label) {
+            await github.rest.issues.addLabels({ ...issue, labels: [label] });
+          }
+          core.setFailed(
+            `@${author} is not a member of ${teams.map((t) => `'${t}'`).join(' or ')} in ${org}. ` +
+            `A CLA signature is required before this PR can be merged.`
+          );

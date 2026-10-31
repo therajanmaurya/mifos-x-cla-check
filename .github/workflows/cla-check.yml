@@ -1,0 +1,59 @@
+# Reusable workflow wrapper around the composite action in this repo (action.yml).
+#
+# Shortest setup for a caller, but GitHub names the resulting check `<caller-job> / check-contributor-membership`.
+# If a ruleset or branch protection requires the exact check name `check-contributor-membership`, use the
+# composite action directly instead (see README → "Keep the existing required check name").
+name: CLA contributor check (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      org:
+        description: 'Organization whose teams hold the approved contributors.'
+        type: string
+        default: 'openMF'
+      teams:
+        description: 'Comma-separated team slugs; membership in any one of them clears the check.'
+        type: string
+        default: 'contributors,contracted-contributors'
+      cla-url:
+        description: 'Where a contributor signs the CLA.'
+        type: string
+        default: 'https://mifos.org/about-us/financial-legal/mifos-contributor-agreement'
+      label:
+        description: 'Label added while the CLA is missing. Empty disables labelling.'
+        type: string
+        default: 'cla-required'
+      runs-on:
+        description: 'Runner label. Defaults to vars.CI_RUNNER_LINUX, else ubuntu-26.04.'
+        type: string
+        default: ''
+    secrets:
+      CLA_APP_ID:
+        required: true
+      CLA_APP_PRIVATE_KEY:
+        required: true
+    outputs:
+      verified:
+        description: '`true` when the author is in an approved team (or is a skipped bot).'
+        value: ${{ jobs.check-contributor-membership.outputs.verified }}
+
+jobs:
+  check-contributor-membership:
+    runs-on: ${{ inputs.runs-on || vars.CI_RUNNER_LINUX || 'ubuntu-26.04' }}
+    permissions:
+      pull-requests: write
+      statuses: write
+    outputs:
+      verified: ${{ steps.cla.outputs.verified }}
+    steps:
+      - name: Mifos CLA check
+        id: cla
+        uses: therajanmaurya/mifos-x-cla-check@v1
+        with:
+          app-id: ${{ secrets.CLA_APP_ID }}
+          private-key: ${{ secrets.CLA_APP_PRIVATE_KEY }}
+          org: ${{ inputs.org }}
+          teams: ${{ inputs.teams }}
+          cla-url: ${{ inputs.cla-url }}
+          label: ${{ inputs.label }}
