@@ -1,0 +1,34 @@
+# Repository self-test: lint every workflow and the action metadata on each push and pull request.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ${{ vars.CI_RUNNER_LINUX || 'ubuntu-26.04' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: actionlint (workflows)
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color -ignore 'label ".+" is unknown'
+
+      - name: Validate action.yml
+        run: |
+          python3 - <<'PY'
+          import yaml, sys
+          a = yaml.safe_load(open('action.yml'))
+          assert a['runs']['using'] == 'composite', 'action must be composite'
+          for k in ('app-id', 'private-key'):
+              assert a['inputs'][k]['required'] is True, f'{k} must be required'
+          for k, v in a['inputs'].items():
+              assert 'description' in v, f'input {k} needs a description'
+          print('action.yml OK:', len(a['inputs']), 'inputs,', len(a['outputs']), 'outputs')
+          PY
